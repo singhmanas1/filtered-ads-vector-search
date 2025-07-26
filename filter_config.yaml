@@ -28,8 +28,8 @@ filter_configurations:
 active_filters:
   #- "low_rated"
   #- "high_rated" 
-  - "mid_rated"
-  # - "all_data"
+  #- "mid_rated"
+  - "all_data"
   # - "premium_only"
 
 # Global filter settings

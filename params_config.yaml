@@ -36,7 +36,6 @@ global_settings:
   num_queries: 10000
   batch_size: 100
   num_workers_params: 1
-  num_workers_throughput: 2
   persistent: false
   run_time_seconds: 30
 
