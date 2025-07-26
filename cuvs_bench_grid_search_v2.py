@@ -35,6 +35,7 @@ from utils_grid_search import (
     
     # Filtering and Rating
     create_rating_filter,
+    count_selected_samples,
     
     # Ground Truth and Evaluation
     generate_one_time_ground_truth,
@@ -594,7 +595,7 @@ def unified_grid_search(vectors=None, queries=None, vectors_fp=None, queries_fp=
     
     # Create filter if rating ranges provided
     filter_obj = None
-    filtering_percentage = 0  # Default: no filtering
+    actual_filtering_percentage = 0  # Default: no filtering
     if rating_ranges is not None:
         logger.info(f"Creating filter for {queries.shape[0]} queries...")
         filter_obj, bitquery = create_rating_filter(
@@ -607,29 +608,25 @@ def unified_grid_search(vectors=None, queries=None, vectors_fp=None, queries_fp=
         )
         logger.info("Filter created successfully")
         
+        # Calculate actual filtering percentage from bitquery
+        total_samples = vectors.shape[0]
+        actual_included_samples = count_selected_samples(bitquery)
+        actual_included_percentage = (actual_included_samples / total_samples) * 100
+        actual_filtering_percentage = 100 - actual_included_percentage
+        
+        logger.info(f"Actual filter statistics:")
+        logger.info(f"  - Total samples: {total_samples}")
+        logger.info(f"  - Included samples: {actual_included_samples}")
+        logger.info(f"  - Included percentage: {actual_included_percentage:.2f}%")
+        logger.info(f"  - Filtered out percentage: {actual_filtering_percentage:.2f}%")
+        
         if algorithm.lower() == "hnsw":
-            bitquery_numpy = bitquery.get().view(np.uint8) 
-            logger.info("Converting filter to numpy ")
-            logger.info(f"bit query {bitquery_numpy}")
-            logger.info(f"{type(bitquery_numpy)}")
-            logger.info(f"{len(bitquery_numpy)}, {bitquery[:10]}")
-
-        # Calculate filtering percentage based on rating distribution
-        rating_distribution = config['rating_distribution']
-        
-        total_percentage = sum(rating_distribution.values())
-        
-        # Calculate percentage of data included by the filter
-        included_percentage = sum(config['rating_distribution'].get(r, 0) for r in rating_ranges)
-        
-        # Calculate percentage filtered out
-        filtering_percentage = 100 - (included_percentage / total_percentage * 100)
-        
-        logger.info(f"Filter excludes approximately {filtering_percentage:.2f}% of data")
+            bitquery_numpy = bitquery.get().view(np.uint8)
+            logger.info("Converting filter to numpy")
 
     # --- Compute rating_suffix and add vector count and filtering percentage ---
     rating_suffix = f"_{'_'.join(rating_ranges)}" if filter_obj is not None else ""
-    data_info_suffix = f"_{total_vectors_count}vecs_filter{filtering_percentage:.0f}pct"
+    data_info_suffix = f"_{total_vectors_count}vecs_filter{actual_filtering_percentage:.0f}pct"
 
     # Generate ground truth if not provided
     if gt_indices is None:
@@ -639,7 +636,8 @@ def unified_grid_search(vectors=None, queries=None, vectors_fp=None, queries_fp=
             val_vectors=queries_fp,
             k=k,
             filter_obj=filter_obj,  # Pass the filter object
-            logger=logger
+            logger=logger,
+            batch_size=1000
         )
         logger.info("Ground truth generation complete")
     
@@ -647,7 +645,7 @@ def unified_grid_search(vectors=None, queries=None, vectors_fp=None, queries_fp=
     logger.info(f"Algorithm: {algorithm}")
     logger.info(f"Quantization type: {quantization_type}")
     logger.info(f"Total vectors: {total_vectors_count:,}")
-    logger.info(f"Filtering percentage: {filtering_percentage:.2f}%")
+    logger.info(f"Filtering percentage: {actual_filtering_percentage:.2f}%")
 
     logger.info(f"Metric: {metric}")
     logger.info(f"Build algorithm: {build_algo}")
@@ -706,7 +704,7 @@ def unified_grid_search(vectors=None, queries=None, vectors_fp=None, queries_fp=
                 
             # Add information about filter to result if available
             if filter_obj is not None:
-                result['filtering_percentage'] = filtering_percentage
+                result['filtering_percentage'] = actual_filtering_percentage
             
             print("results intermed ", result)
             # Save intermediate results

@@ -518,7 +518,7 @@ def load_vector_data(vectors=None, queries=None, vectors_fp=None, queries_fp=Non
     
     return vectors, queries, vectors_fp, queries_fp
 
-def generate_one_time_ground_truth(train_vectors, val_vectors, k=10, filter_obj=None, logger=None):
+def generate_one_time_ground_truth(train_vectors, val_vectors, k=10, filter_obj=None, logger=None, batch_size=1000):
     """
     Generate ground truth using provided train and validation vectors.
     No explicit GPU memory pool is used.
@@ -544,7 +544,7 @@ def generate_one_time_ground_truth(train_vectors, val_vectors, k=10, filter_obj=
     logger.debug("Calculating ground truth...")
     try:
         # Pass the filter to calc_truth if provided
-        _, gt_indices = calc_truth(train_vectors, val_vectors, k, metric="sqeuclidean", filter=filter_obj)
+        _, gt_indices = calc_truth(train_vectors, val_vectors, k, metric="sqeuclidean", filter=filter_obj, batch_size=batch_size)
 
         # Ensure gt_indices is numpy array and correct type
         if hasattr(gt_indices, 'get'):  # For cupy arrays
@@ -614,7 +614,6 @@ def batch_search_hnsw(queries, hnsw_index, search_params, filter_obj, k, batch_s
     n_queries = queries.shape[0]
     all_indices = np.zeros((n_queries, k), dtype=np.int32)
     total_search_time = 0
-    
     for start_idx in range(0, n_queries, batch_size):
         end_idx = min(start_idx + batch_size, n_queries)
         batch_queries = queries[start_idx:end_idx]
@@ -951,7 +950,7 @@ def cpu_search(dataset, queries, k, metric="squeclidean"):
 
     return distances, indices
 
-def calc_truth(dataset, queries, k, metric="sqeuclidean", filter=None):
+def calc_truth(dataset, queries, k, metric="sqeuclidean", filter=None, batch_size=1000):
     """
     Calculate ground truth nearest neighbors with optional filtering.
     
@@ -967,6 +966,8 @@ def calc_truth(dataset, queries, k, metric="sqeuclidean", filter=None):
         Distance metric to use
     filter : object, optional
         Filter object to apply during search
+    batch_size : int, optional
+        Number of queries to process at once
     
     Returns:
     --------
@@ -984,18 +985,30 @@ def calc_truth(dataset, queries, k, metric="sqeuclidean", filter=None):
             # Build index with full dataset
             index = build(dataset, metric=metric)
             
-            # Search with optional filter
-            print("Searching with full dataset...")
-            if filter is not None:
-                D, Ind = search(index, queries, k, prefilter=filter)
-            else:
-                D, Ind = search(index, queries, k)
+            # Initialize result arrays
+            n_queries = queries.shape[0]
+            all_distances = xp.zeros((n_queries, k), dtype=xp.float32)
+            all_indices = xp.zeros((n_queries, k), dtype=xp.int64)
+            
+            # Search in batches
+            print(f"Searching with batches of {batch_size}...")
+            for start_idx in range(0, n_queries, batch_size):
+                end_idx = min(start_idx + batch_size, n_queries)
+                batch_queries = queries[start_idx:end_idx]
+                
+                if filter is not None:
+                    D, Ind = search(index, batch_queries, k, prefilter=filter)
+                else:
+                    D, Ind = search(index, batch_queries, k)
+                
+                all_distances[start_idx:end_idx] = D
+                all_indices[start_idx:end_idx] = Ind
                 
             resources.sync()
             
             # Convert results back to CPU before returning
-            distances = xp.asnumpy(D)
-            indices = xp.asnumpy(Ind)
+            distances = xp.asnumpy(all_distances)
+            indices = xp.asnumpy(all_indices)
             
         finally:
             # Clean up GPU memory
