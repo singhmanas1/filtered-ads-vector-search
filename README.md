@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 ### Option 1: AWS S3 Bucket (Alternative)
 
-If you don't have access to the Google Drive folder, you can access the data from the [AWS S3 bucket](https://us-east-1.console.aws.amazon.com/s3/buckets/amazon-ads-vector-search?region=us-east-1&tab=objects&bucketType=general).
+If you don't have access to the Google Drive folder, you can access the data from the 
 
 1. Download the raw data from the S3 bucket
 2. Use the provided `index_data.ipynb` notebook to convert the data to embeddings format:
@@ -39,7 +39,7 @@ This will process the raw data and create the required `embeddings/` folder stru
 
 ### Option 2: Download from Google Drive (If you don't have access to the AWS S3 Bucket)
 
-1. Download the sample data from [Google Drive](https://drive.google.com/drive/folders/1PlvcajPYOrpjAGd4i2mUOO2H0MJc6zIr)
+1. Download the sample data from [Google Drive]
    - `sample_1M.tar.gz` (309.4 MB) - 1M vectors sample
    - `sample_6M.tar.gz` (1.81 GB) - 6M vectors sample
 
