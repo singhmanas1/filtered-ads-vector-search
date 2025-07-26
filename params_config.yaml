@@ -1,0 +1,62 @@
+# CAGRA parameter configurations by data size
+cagra_params_by_size:
+  1000000:  # 1M vectors
+    intermediate_graph_degree: [32, 64, 128]
+    graph_degree: [8, 16, 32, 64]
+    itopk_size: [64, 128, 256]
+    search_width: [2, 4, 8, 16]
+    max_search_iterations: [0]
+    
+  5010000:  # 5M vectors - increase parameters
+    intermediate_graph_degree: [32, 64, 128]
+    graph_degree: [8, 16, 32, 64]
+    itopk_size: [64, 128, 256]
+    search_width: [2, 4, 8, 16]
+    max_search_iterations: [0]
+    
+  10000000:  # 10M vectors - further increase
+    intermediate_graph_degree: [32, 64, 128]
+    graph_degree: [8, 16, 32, 64]
+    itopk_size: [64, 128, 256]
+    search_width: [2, 4, 8, 16]
+    max_search_iterations: [0]
+    
+  60000000:  # 60M vectors
+    intermediate_graph_degree: [32, 64, 128]
+    graph_degree: [8, 16, 32, 64]
+    itopk_size: [64, 128, 256]
+    search_width: [2, 4, 8, 16]
+    max_search_iterations: [0]
+
+# Data sizes to evaluate
+data_sizes: [5010000]
+
+# HNSW parameter configurations
+hnsw_params:
+    'M': [16, 32]
+    'efConstruction': [32, 64, 128, 256, 512]
+    'efSearch': [8, 16, 32, 64, 128, 256, 512, 768, 1024]
+
+# Global settings
+global_settings:
+  num_queries: 10000
+  batch_size: 100
+  num_workers_params: 1
+  num_workers_throughput: 2
+  persistent: false
+  run_time_seconds: 30
+
+# Exclude specific parameter combinations
+exclude_combinations: []
+  # Example:
+  # - intermediate_graph_degree: 64
+  #   graph_degree: 64
+  #   itopk_size: 64
+  #   search_width: 8
+  #   max_search_iterations: 1000
+
+# Results directory settings
+results_settings:
+  results_dir: "comprehensive_comparison_results"
+  save_intermediate: true
+  cleanup_pause_seconds: 30 

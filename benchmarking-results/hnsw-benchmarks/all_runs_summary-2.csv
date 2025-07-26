@@ -1,0 +1,4 @@
+data_size,filter_name,filter_ranges,run_time_minutes,best_recall,best_qps,best_qps_params,parameters_tested,output_file
+5010000,low_rated,['<1.0'],222.44220515886943,0.91401,21890.059741857975,{},48,comprehensive_comparison_results/results_5010000vecs_low_rated.csv
+5010000,high_rated,"['3.0-4.0', '4.0-5.0', '=5.0']",218.02499471902848,0.91867,22672.587563414047,{},48,comprehensive_comparison_results-2/results_5010000vecs_high_rated.csv
+5010000,mid_rated,"['1.0-2.0', '2.0-3.0']",220.88739936351777,0.80142,24271.581276706063,{},48,comprehensive_comparison_results-2/results_5010000vecs_mid_rated.csv

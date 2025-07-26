@@ -1,0 +1,39 @@
+# Filter configurations for different rating ranges
+filter_configurations:
+  all_data:
+    ranges: ["<1.0","1.0-2.0", "2.0-3.0","3.0-4.0", "4.0-5.0","=5.0"]
+    description: "No filtering - all data"
+    
+  low_rated:
+    ranges: ["<1.0"]
+    description: "Low rated items only (83.63%)"
+    
+  high_rated:
+    ranges: ["3.0-4.0", "4.0-5.0", "=5.0"]
+    description: "High rated items (15.61%)"
+    
+  mid_rated:
+    ranges: ["1.0-2.0", "2.0-3.0"]
+    description: "Mid rated items (0.77%)"
+    
+  premium_only:
+    ranges: ["=5.0"]
+    description: "Perfect rating items only"
+    
+  good_and_excellent:
+    ranges: ["4.0-5.0", "=5.0"]
+    description: "Good and excellent ratings"
+
+# Which configurations to run (comment out to skip)
+active_filters:
+  - "low_rated"
+  - "high_rated" 
+  - "mid_rated"
+  # - "all_data"
+  # - "premium_only"
+
+# Global filter settings
+global_filter_settings:
+  verbose: true
+  visualize: false
+  max_memory_gb: null 
