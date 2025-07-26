@@ -12,10 +12,10 @@ aiohttp
 
 # GPU computing
 cupy-cuda12x>=13.0.0
-cuvs-cu12
+cuvs-cu12>=25.6.0
 
 # RAPIDS ecosystem (CUDA 12)
-cuml-cu12>=25.4.0
+cuml-cu12>=25.6.0
 rmm-cu12>=25.4.0
 
 # Vector search libraries

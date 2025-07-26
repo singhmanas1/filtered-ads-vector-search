@@ -26,8 +26,8 @@ filter_configurations:
 
 # Which configurations to run (comment out to skip)
 active_filters:
-  - "low_rated"
-  - "high_rated" 
+  #- "low_rated"
+  #- "high_rated" 
   - "mid_rated"
   # - "all_data"
   # - "premium_only"
@@ -37,3 +37,11 @@ global_filter_settings:
   verbose: true
   visualize: false
   max_memory_gb: null 
+
+rating_distribution:
+  '<1.0': 83.63
+  '1.0-2.0': 0.35
+  '2.0-3.0': 0.42
+  '3.0-4.0': 2.42
+  '4.0-5.0': 9.71
+  '=5.0': 3.48

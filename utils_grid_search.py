@@ -87,7 +87,38 @@ def calc_recall(found_indices, ground_truth):
     recall = n / (bs * ground_truth.shape[1])
     return recall
 
-
+def load_all_input_configs(config_path, logger):
+    """Load and process all input configuration files"""
+    filter_config = load_config(os.path.join(config_path, 'filter_config.yaml'))
+    params_config = load_config(os.path.join(config_path, 'params_config.yaml'))
+    
+    # Process configurations
+    active_filters = filter_config.get('active_filters', ['low_rated', 'high_rated', 'mid_rated'])
+    filter_configurations = [(filter_config['filter_configurations'][name]['ranges'], name) 
+                           for name in active_filters if name in filter_config['filter_configurations']]
+    
+    config = {
+        'filter_configurations': filter_configurations,
+        'global_filter_settings': filter_config.get('global_filter_settings', {}),
+        'rating_distribution': filter_config.get('rating_distribution', {}),  # Add this line
+        'cagra_params': params_config['cagra_params'],
+        'hnsw_params': params_config['hnsw_params'],
+        'data_sizes': params_config.get('data_sizes', [5010000]),
+        **params_config.get('global_settings', {}),
+        **params_config.get('results_settings', {})
+    }
+    
+    # Set defaults
+    defaults = {'num_queries': 10000, 'batch_size': 100, 'num_workers_params': 1, 
+                'num_workers_throughput': 2, 'persistent': False, 'run_time_seconds': 30,
+                'results_dir': 'comprehensive_comparison_results-test', 'save_intermediate': True, 
+                'cleanup_pause_seconds': 30}
+    
+    for key, default in defaults.items():
+        config.setdefault(key, default)
+    
+    logger.info(f"Loaded {len(config['filter_configurations'])} filters, CAGRA params, HNSW params")
+    return config
 
 def load_config(config_path, default_config=None):
     """Load configuration from YAML file with fallback to default."""
@@ -158,7 +189,8 @@ def create_rating_distribution_bitquery(
     selected_ranges=None, 
     device_id=0, 
     verbose=False,
-    batch_size=5_000_000  # Default batch size appropriate for large datasets
+    batch_size=5_000_000,
+    config=None  # Default batch size appropriate for large datasets
 ):
     """
     Create a single query-specific filter based on rating distribution.
@@ -181,14 +213,8 @@ def create_rating_distribution_bitquery(
     with cp.cuda.Device(device_id):
         # Rating distribution data
         #TO-do: make this a config file
-        rating_distribution = {
-            '<1.0': 83.63,
-            '1.0-2.0': 0.35,
-            '2.0-3.0': 0.42,
-            '3.0-4.0': 2.42,
-            '4.0-5.0': 9.71,
-            '=5.0': 3.48
-        }
+        rating_distribution = config['rating_distribution']
+
         total = sum(rating_distribution.values())
         rating_probabilities = {k: v/total for k, v in rating_distribution.items()}
 
@@ -271,44 +297,7 @@ def _validate_device_id(device_id):
     
     return device_id
 
-def create_rating_filter_hnsw(num_vectors, n_queries, valid_ranges, seed):
-    rating_distribution = {
-            '<1.0': 83.63,
-            '1.0-2.0': 0.35,
-            '2.0-3.0': 0.42,
-            '3.0-4.0': 2.42,
-            '4.0-5.0': 9.71,
-            '=5.0': 3.48
-    }
-    print("valid ranges ",valid_ranges)
-    total = sum(rating_distribution.values())
-    rating_probabilities = {k: v/total for k, v in rating_distribution.items()}
-
-    # Default to all ranges if none specified
-    if valid_ranges is None:
-        valid_ranges = list(rating_distribution.keys())
-
-    # Calculate target percentage based on selected ranges
-    ranges = list(rating_probabilities.keys())
-    selected_indices = [i for i, r in enumerate(ranges) if r in valid_ranges]
-    selected_prob_total = sum(rating_probabilities[ranges[i]] for i in selected_indices)
-    print("keep total probability ",selected_prob_total)
-    remove_prob = 1.0 - selected_prob_total
-    print("remove total probability ",remove_prob)
-    if seed is not None:
-        np.random.seed(seed)
-    keep_mask = np.random.rand(num_vectors) > remove_prob  # True = keep
-    packed_bitmap = np.packbits(keep_mask.astype(bool), bitorder='little')
-    # Count number of 1s (kept) and 0s (filtered out)
-    keep_mask_int = keep_mask.astype(int)
-    num_ones = np.sum(keep_mask_int)
-    num_zeros = num_vectors - num_ones
-
-    print(f"Number of 1s (kept): {num_ones}")
-    print(f"Number of 0s (filtered out): {num_zeros}")
-    return packed_bitmap
-
-def create_rating_filter(n_samples, n_queries, valid_ranges, device_id=0, max_memory_gb=None, verbose=True, visualize=False):
+def create_rating_filter(n_samples, n_queries, valid_ranges, device_id=0, max_memory_gb=None, verbose=True, visualize=False, config=None):
     """
     Create a filter based on selected rating ranges
     
@@ -334,16 +323,12 @@ def create_rating_filter(n_samples, n_queries, valid_ranges, device_id=0, max_me
     # Validate device_id
     device_id = _validate_device_id(device_id)
     
-    # bitmap = create_rating_distribution_bitmap(
-    #     n_samples, n_queries, valid_ranges, 
-    #     device_id=device_id, max_memory_gb=max_memory_gb,
-    #     verbose=verbose, visualize=visualize
-    # )
     print("valid ranges", valid_ranges)
     bitquery = create_rating_distribution_bitquery(
         n_samples, valid_ranges, 
         device_id=device_id,
         verbose=verbose,
+        config=config
     )
     
     filter_obj = filters.from_bitset(bitquery)
@@ -533,516 +518,6 @@ def load_vector_data(vectors=None, queries=None, vectors_fp=None, queries_fp=Non
     
     return vectors, queries, vectors_fp, queries_fp
 
-def create_visualization_plots(results_df, output_prefix="comparison"):
-    """
-    Create and save visualization plots in the style of NVIDIA's ANN-benchmarking tool:
-    1. Bar chart showing build time versus recall bins with count annotations
-    2. Scatter plot of recall vs P99 latency with smooth fitted lines
-    3. Scatter plot of recall vs queries per second (QPS) with smooth fitted lines
-    
-    Args:
-        results_df: DataFrame of results (must contain 'algorithm' and 'quantization_type' columns)
-        output_prefix: Prefix for output filename
-        
-    Returns:
-        bool: True if plots were created successfully, False otherwise
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    from scipy.stats import binned_statistic
-    from scipy import interpolate
-    import itertools
-    from collections import OrderedDict
-    from scipy.interpolate import make_interp_spline
-    import logging
-
-    logger = logging.getLogger('cagra_logger')
-    
-    if results_df.empty or 'recall' not in results_df.columns:
-        logger.debug("No valid results to plot")
-        return False
-    
-    # Check required columns
-    required_columns = ['algorithm', 'quantization_type']
-    missing_columns = [col for col in required_columns if col not in results_df.columns]
-    if missing_columns:
-        logger.debug(f"Missing required columns: {missing_columns}")
-        return False
-    
-    # Make a copy to avoid modifying the original
-    df = results_df.copy()
-    
-    # Drop rows with missing values for any plots
-    valid_results = df.dropna(subset=['recall', 'build_time_seconds', 'p99_query_latency_ms'])
-    if valid_results.empty:
-        logger.debug("No valid results after dropping NAs")
-        return False
-    
-    # Calculate queries per second (QPS) from latency
-    valid_results['queries_per_second'] = 1000 / valid_results['avg_query_latency_ms']
-    
-    # Create recall bins (aligned with user requirements)
-    recall_bins = [0, 0.8, 0.9, 0.95, 0.99, 1.0]
-    recall_labels = ['<80%', '80-90%', '90-95%', '95-99%', '99%+']
-    
-    valid_results['recall_bin'] = pd.cut(valid_results['recall'], 
-                                       bins=recall_bins, 
-                                       labels=recall_labels, 
-                                       include_lowest=True)
-    
-    # Create algorithm-quantization combinations for legend
-    valid_results['algo_quant'] = valid_results.apply(
-        lambda row: f"{row['algorithm']} - {row['quantization_type']}", axis=1
-    )
-    
-    # Get unique algorithm-quantization combinations
-    algo_quant_combos = valid_results['algo_quant'].unique()
-    
-    # Generate algorithm-specific colors
-    def generate_n_colors(n):
-        vs = np.linspace(0.3, 0.9, 7)
-        colors = [(0.9, 0.4, 0.4, 1.0)]
-
-        def euclidean(a, b):
-            return sum((x - y) ** 2 for x, y in zip(a, b))
-
-        while len(colors) < n:
-            new_color = max(
-                itertools.product(vs, vs, vs),
-                key=lambda a: min(euclidean(a, b) for b in colors),
-            )
-            colors.append(new_color + (1.0,))
-        return colors
-    
-    def create_linestyles(unique_combos):
-        colors = dict(
-            zip(unique_combos, generate_n_colors(len(unique_combos)))
-        )
-        linestyles = dict(
-            (combo, ["--", "-.", "-", ":"][i % 4])
-            for i, combo in enumerate(unique_combos)
-        )
-        markerstyles = dict(
-            (combo, ["+", "<", "o", "*", "x"][i % 5])
-            for i, combo in enumerate(unique_combos)
-        )
-        faded = dict(
-            (combo, (r, g, b, 0.3)) for combo, (r, g, b, a) in colors.items()
-        )
-        return dict(
-            (
-                combo,
-                (colors[combo], faded[combo], linestyles[combo], markerstyles[combo]),
-            )
-            for combo in unique_combos
-        )
-    
-    # Generate algorithm-quantization specific styles
-    linestyles = create_linestyles(sorted(algo_quant_combos))
-    
-    # Extract dataset info for titles and handle NaN values
-    num_vectors_by_combo = {}
-    batch_size_by_combo = {}
-    
-    for combo in algo_quant_combos:
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        
-        # Get total vectors if available
-        if 'total_vectors' in combo_data.columns:
-            total_vec_value = combo_data['total_vectors'].iloc[0]
-            if pd.isna(total_vec_value):
-                num_vectors_by_combo[combo] = "Unknown"
-            else:
-                num_vectors_by_combo[combo] = f"{int(total_vec_value):,}"
-        else:
-            num_vectors_by_combo[combo] = "Unknown"
-            
-        # Similar check for batch size
-        if 'batch_size' in combo_data.columns:
-            batch_size_value = combo_data['batch_size'].iloc[0]
-            if pd.isna(batch_size_value):
-                batch_size_by_combo[combo] = "Unknown"
-            else:
-                batch_size_by_combo[combo] = int(batch_size_value)
-        else:
-            batch_size_by_combo[combo] = "Unknown"
-    
-    # Create dataset info for title
-    dataset_info = " | ".join([f"{combo}: {num_vectors_by_combo[combo]} vectors, batch size {batch_size_by_combo[combo]}" 
-                              for combo in algo_quant_combos])
-    
-    # Function to create a smooth fit line from data points
-    def create_smooth_fit(x, y, smoothness=50):
-        """Create a smooth fit line with spline interpolation"""
-        # First sort the data by x
-        indices = np.argsort(x)
-        x_sorted = x[indices]
-        y_sorted = y[indices]
-        
-        # Remove duplicate x values which would break the spline
-        _, unique_indices = np.unique(x_sorted, return_index=True)
-        x_unique = x_sorted[unique_indices]
-        y_unique = y_sorted[unique_indices]
-        
-        if len(x_unique) < 4:  # Need at least 4 points for cubic spline
-            # Just return the sorted points for a simple line
-            return x_unique, y_unique
-        
-        # Create the smooth spline function
-        try:
-            # Create smooth spline with more points
-            x_smooth = np.linspace(min(x_unique), max(x_unique), smoothness)
-            spl = make_interp_spline(x_unique, y_unique, k=3)  # cubic spline
-            y_smooth = spl(x_smooth)
-            return x_smooth, y_smooth
-        except Exception as e:
-            # Fallback if spline fails
-            print(f"Spline failed: {e}, falling back to original data")
-            return x_unique, y_unique
-    
-    # Function to help with sorting algorithm combos (similar to NVIDIA code)
-    def mean_y(combo):
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        return -np.log(combo_data['p99_query_latency_ms'].mean())
-    
-    # =====================================================
-    # 1. SEARCH PERFORMANCE PLOT (Recall vs P99 Latency)
-    # =====================================================
-    plt.figure(figsize=(12, 9))
-    
-    # Process each algorithm-quantization combination
-    for combo in sorted(algo_quant_combos, key=mean_y):
-        # Filter data for this combination
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        
-        # Get style for this combination
-        color, faded, linestyle, marker = linestyles[combo]
-        
-        # Extract values
-        xs = combo_data['recall'].values
-        ys = combo_data['p99_query_latency_ms'].values
-        
-        # Create smooth fit
-        x_smooth, y_smooth = create_smooth_fit(xs, ys)
-        
-        # Plot ONLY the smooth fitted line (no data points)
-        plt.plot(
-            x_smooth, 
-            y_smooth,
-            '-',  # Solid line 
-            label=combo,  # Already formatted as "algorithm - quantization_type"
-            color=color,
-            lw=3   # Line width
-        )
-    
-    # Set labels and title
-    plt.xlabel('Recall', fontsize=14)
-    plt.ylabel('P99 Search Latency (ms)', fontsize=14)
-    plt.title(f'Recall vs P99 Latency', fontsize=16)
-    plt.grid(True, alpha=0.3, linestyle='-')
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), prop={'size': 9})
-    
-    # Set axis limits (using NVIDIA approach)
-    plt.xlim(0.8, 1.01)  # Start from 0.8 as in the NVIDIA script
-    
-    plt.tight_layout()
-    
-    # Save the first plot
-    filename_latency = f'{output_prefix}_recall_vs_p99latency.png'
-    plt.savefig(filename_latency, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # =====================================================
-    # 2. QPS PERFORMANCE PLOT (Recall vs Throughput)
-    # =====================================================
-    plt.figure(figsize=(12, 9))
-    
-    # Process each algorithm-quantization combination
-    for combo in sorted(algo_quant_combos, key=mean_y):
-        # Filter data for this combination
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        
-        # Get style for this combination
-        color, faded, linestyle, marker = linestyles[combo]
-        
-        # Extract values
-        xs = combo_data['recall'].values
-        ys = combo_data['queries_per_second'].values
-        
-        # Create smooth fit
-        x_smooth, y_smooth = create_smooth_fit(xs, ys)
-        
-        # Plot ONLY the smooth fitted line (no data points)
-        plt.plot(
-            x_smooth, 
-            y_smooth,
-            '-',  # Solid line
-            label=combo,  # Already formatted as "algorithm - quantization_type"
-            color=color,
-            lw=3   # Line width
-        )
-    
-    # Set labels and title
-    plt.xlabel('Recall', fontsize=14)
-    plt.ylabel('Queries per Second (QPS)', fontsize=14)
-    plt.title(f'Recall vs Throughput', fontsize=16)
-    plt.grid(True, alpha=0.3, linestyle='-')
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), prop={'size': 9})
-    
-    # Set axis limits
-    plt.xlim(0.8, 1.01)  # Start from 0.8 as in the NVIDIA script
-    
-    plt.tight_layout()
-    
-    # Save the second plot
-    filename_qps = f'{output_prefix}_recall_vs_qps.png'
-    plt.savefig(filename_qps, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # =====================================================
-    # 3. BUILD TIME BAR CHART - With sample counts and build time annotations
-    # =====================================================
-    
-    # Setup for build time chart - with sample counts
-    bt_below_80 = [0] * len(algo_quant_combos)
-    bt_80 = [0] * len(algo_quant_combos)
-    bt_90 = [0] * len(algo_quant_combos)
-    bt_95 = [0] * len(algo_quant_combos)
-    bt_99 = [0] * len(algo_quant_combos)
-    
-    # Track sample counts for each bin
-    count_below_80 = [0] * len(algo_quant_combos)
-    count_80 = [0] * len(algo_quant_combos)
-    count_90 = [0] * len(algo_quant_combos)
-    count_95 = [0] * len(algo_quant_combos)
-    count_99 = [0] * len(algo_quant_combos)
-    
-    data = OrderedDict()
-    colors = OrderedDict()
-    sample_counts = OrderedDict()  # To store counts for annotations
-    
-    # Process each algorithm-quantization combination
-    for pos, combo in enumerate(sorted(algo_quant_combos, key=mean_y)):
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        
-        # Extract recall and build time values
-        xs = combo_data['recall'].values
-        build_times = combo_data['build_time_seconds'].values
-        
-        # Count samples and sum build times for each bin
-        for i, recall in enumerate(xs):
-            if recall < 0.80:
-                bt_below_80[pos] += build_times[i]
-                count_below_80[pos] += 1
-            elif recall >= 0.80 and recall < 0.90:
-                bt_80[pos] += build_times[i]
-                count_80[pos] += 1
-            elif recall >= 0.90 and recall < 0.95:
-                bt_90[pos] += build_times[i]
-                count_90[pos] += 1
-            elif recall >= 0.95 and recall < 0.99:
-                bt_95[pos] += build_times[i]
-                count_95[pos] += 1
-            elif recall >= 0.99:
-                bt_99[pos] += build_times[i]
-                count_99[pos] += 1
-        
-        # Calculate averages
-        if count_below_80[pos] > 0:
-            bt_below_80[pos] /= count_below_80[pos]
-        if count_80[pos] > 0:
-            bt_80[pos] /= count_80[pos]
-        if count_90[pos] > 0:
-            bt_90[pos] /= count_90[pos]
-        if count_95[pos] > 0:
-            bt_95[pos] /= count_95[pos]
-        if count_99[pos] > 0:
-            bt_99[pos] /= count_99[pos]
-        
-        # Store in data dictionary
-        data[combo] = [bt_below_80[pos], bt_80[pos], bt_90[pos], bt_95[pos], bt_99[pos]]
-        sample_counts[combo] = [count_below_80[pos], count_80[pos], count_90[pos], count_95[pos], count_99[pos]]
-        colors[combo] = linestyles[combo][0]  # Get primary color
-    
-    # Setup index for plotting
-    index = [
-        "<80% Recall",
-        "80-90% Recall",
-        "90-95% Recall",
-        "95-99% Recall",
-        "99%+ Recall",
-    ]
-    
-    # Create DataFrame for plotting
-    df = pd.DataFrame(data, index=index)
-    df.replace(0.0, np.nan, inplace=True)
-    df = df.dropna(how='all')
-    
-    # Create a counts DataFrame
-    counts_df = pd.DataFrame(sample_counts, index=index)
-    
-    # Plot bar chart
-    plt.figure(figsize=(14, 10))  # Slightly larger for annotations
-    ax = df.plot.bar(rot=0, color=colors)
-    
-    # Add sample count and build time annotations to each bar
-    for i, container in enumerate(ax.containers):
-        combo = list(data.keys())[i]
-        for j, bar in enumerate(container):
-            if j < len(df.index) and not np.isnan(df[combo][j]):
-                value = df[combo][j]
-                count = counts_df[combo][j]
-                
-                if count > 0:  # Only annotate bars with data
-                    # Format value and add count
-                    label = f"n={count}\n{value:.1f}s"
-                    
-                    # Place label above the bar
-                    height = bar.get_height()
-                    ax.text(
-                        bar.get_x() + bar.get_width()/2,
-                        height + 0.5,  # Slightly above the bar
-                        label,
-                        ha='center',
-                        va='bottom',
-                        fontsize=9,
-                        rotation=0
-                    )
-    
-    # Set labels and title
-    plt.xlabel('Recall Range', fontsize=14)
-    plt.ylabel('Average Build Time (seconds)', fontsize=14)
-    plt.title(
-        f"Average Build Time within Recall Range",
-        fontsize=16
-    )
-    plt.grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    
-    # Save the bar chart
-    filename_build = f'{output_prefix}_build_time.png'
-    plt.savefig(filename_build, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # =====================================================
-    # 4. COMBINED PLOT (All three visualizations in one figure)
-    # =====================================================
-    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
-    
-    # Add a main title with dataset info
-    fig.suptitle(f"Vector Search Benchmark: {dataset_info}", fontsize=14, y=0.98)
-    
-    # Plot 1: Build Time Bar Chart
-    df.plot.bar(rot=0, color=colors, ax=axes[0])
-    
-    # Add sample count and build time annotations to each bar
-    for i, container in enumerate(axes[0].containers):
-        combo = list(data.keys())[i]
-        for j, bar in enumerate(container):
-            if j < len(df.index) and not np.isnan(df[combo][j]):
-                value = df[combo][j]
-                count = counts_df[combo][j]
-                
-                if count > 0:  # Only annotate bars with data
-                    # Format value and add count
-                    label = f"n={count}\n{value:.1f}s"
-                    
-                    # Place label above the bar
-                    height = bar.get_height()
-                    axes[0].text(
-                        bar.get_x() + bar.get_width()/2,
-                        height + 0.5,  # Slightly above the bar
-                        label,
-                        ha='center',
-                        va='bottom',
-                        fontsize=7,
-                        rotation=0
-                    )
-    
-    axes[0].set_xlabel('Recall Range', fontsize=12)
-    axes[0].set_ylabel('Build Time (seconds)', fontsize=12)
-    axes[0].set_title(f'Build Time by Recall Range', fontsize=14)
-    axes[0].grid(True, alpha=0.3, axis='y')
-    
-    # Plot 2: Recall vs P99 Latency
-    for combo in sorted(algo_quant_combos, key=mean_y):
-        # Filter data for this algorithm-quantization combo
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        
-        # Get style for this algorithm
-        color, faded, linestyle, marker = linestyles[combo]
-        
-        # Extract values
-        xs = combo_data['recall'].values
-        ys = combo_data['p99_query_latency_ms'].values
-        
-        # Create smooth fit
-        x_smooth, y_smooth = create_smooth_fit(xs, ys)
-        
-        # Plot smooth fitted line
-        axes[1].plot(
-            x_smooth, 
-            y_smooth,
-            '-',
-            label=combo,  # Already formatted as "algorithm - quantization_type"
-            color=color,
-            lw=3
-        )
-    
-    # Configure axis 2
-    axes[1].set_xlabel('Recall', fontsize=12)
-    axes[1].set_ylabel('P99 Search Latency (ms)', fontsize=12)
-    axes[1].set_title(f'Recall vs P99 Latency', fontsize=14)
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend(loc='center left', bbox_to_anchor=(1, 0.5), prop={'size': 8})
-    axes[1].set_xlim(0.8, 1.01)
-    
-    # Plot 3: Recall vs QPS
-    for combo in sorted(algo_quant_combos, key=mean_y):
-        # Filter data for this algorithm-quantization combo
-        combo_data = valid_results[valid_results['algo_quant'] == combo]
-        
-        # Get style for this algorithm
-        color, faded, linestyle, marker = linestyles[combo]
-        
-        # Extract values
-        xs = combo_data['recall'].values
-        ys = combo_data['queries_per_second'].values
-        
-        # Create smooth fit
-        x_smooth, y_smooth = create_smooth_fit(xs, ys)
-        
-        # Plot smooth fitted line
-        axes[2].plot(
-            x_smooth, 
-            y_smooth,
-            '-',
-            label=combo,  # Already formatted as "algorithm - quantization_type"
-            color=color,
-            lw=3
-        )
-    
-    # Configure axis 3
-    axes[2].set_xlabel('Recall', fontsize=12)
-    axes[2].set_ylabel('Queries per Second (QPS)', fontsize=12)
-    axes[2].set_title(f'Recall vs Throughput', fontsize=14)
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend(loc='center left', bbox_to_anchor=(1, 0.5), prop={'size': 8})
-    axes[2].set_xlim(0.8, 1.01)
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    
-    # Save the combined plot
-    filename_combined = f'{output_prefix}_combined_plots.png'
-    plt.savefig(filename_combined, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    logger.debug(f"\nVisualization plots saved as multiple files ({filename_latency}, {filename_qps}, {filename_build}, {filename_combined})")
-    
-    return True
-
 def generate_one_time_ground_truth(train_vectors, val_vectors, k=10, filter_obj=None, logger=None):
     """
     Generate ground truth using provided train and validation vectors.
@@ -1106,21 +581,6 @@ def generate_one_time_ground_truth(train_vectors, val_vectors, k=10, filter_obj=
         except Exception:
             pass
         raise
-
-# def generate_ground_truth_hnsw(vectors, queries, k, filter_obj):
-#     d = vectors.shape[1]
-#     index = faiss.IndexFlatL2(d)  # d = vector dimension
-
-#     # Add your database vectors
-#     index.add(vectors)
-
-#     # Create a filter (bitmap)
-#     sel = faiss.IDSelectorBitmap(filter_obj)
-#     params = faiss.SearchParameters(sel=sel)
-
-#     # Perform the search
-#     D, I = index.search(queries, k, params=params)
-#     return D, I
 
 
 def calculate_recall_with_batching(queries, cagra_index, search_params, filter_obj, k, batch_size=32):
