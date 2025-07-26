@@ -583,7 +583,7 @@ def generate_one_time_ground_truth(train_vectors, val_vectors, k=10, filter_obj=
         raise
 
 
-def calculate_recall_with_batching(queries, cagra_index, search_params, filter_obj, k, batch_size=32):
+def batch_search_cagra(queries, cagra_index, search_params, filter_obj, k, batch_size=32):
     n_queries = queries.shape[0]
     all_indices = np.zeros((n_queries, k), dtype=np.int32)
     total_search_time = 0
@@ -607,6 +607,28 @@ def calculate_recall_with_batching(queries, cagra_index, search_params, filter_o
         # Store results
         indices_np = cp.asnumpy(indices)
         all_indices[start_idx:end_idx] = indices_np
+    
+    return all_indices, total_search_time
+
+def batch_search_hnsw(queries, hnsw_index, search_params, filter_obj, k, batch_size=32):
+    n_queries = queries.shape[0]
+    all_indices = np.zeros((n_queries, k), dtype=np.int32)
+    total_search_time = 0
+    
+    for start_idx in range(0, n_queries, batch_size):
+        end_idx = min(start_idx + batch_size, n_queries)
+        batch_queries = queries[start_idx:end_idx]
+        
+        # Time the batch
+        t1 = time.time()
+        
+        distances, indices = hnsw_index.search(batch_queries, k=k, params=search_params)
+        
+        search_time = time.time() - t1
+        total_search_time += search_time
+        
+        # Store results
+        all_indices[start_idx:end_idx] = indices
     
     return all_indices, total_search_time
 

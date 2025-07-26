@@ -38,7 +38,8 @@ from utils_grid_search import (
     
     # Ground Truth and Evaluation
     generate_one_time_ground_truth,
-    calculate_recall_with_batching,
+    batch_search_cagra,
+    batch_search_hnsw,
     calc_recall,
     
     # Algorithm-specific
@@ -220,127 +221,107 @@ def evaluate_parameter_combination_multithreading(params, vectors, queries, vect
         start_time = time.time()
         total_search_time = 0
                 
-        all_indices, total_search_time = calculate_recall_with_batching(queries, cagra_index, search_params, filter_obj, 
+        all_indices, total_search_time = batch_search_cagra(queries, cagra_index, search_params, filter_obj, 
                                                                         k, batch_size=batch_size)
         
-        # Calculate recall if ground truth available
-        recall_score = None
-        if gt_indices is not None:
-            # Only compare up to n_queries
-            recall_score = calc_recall(all_indices, gt_indices)
-            logger.info(f"Recall: {recall_score:.4f}")
+
+        # Only compare up to n_queries
+        recall_score = calc_recall(all_indices, gt_indices)
+        logger.info(f"Recall: {recall_score:.4f}")
         
         # ============== THROUGHPUT CALCULATION (PARALLEL) ==============
         # Now measure throughput with multiple processes, similar to Milvus benchmark
         
         # Prepare batches of queries based on different batch sizes
-        batch_sizes_to_test = [1, 10, 50] if batch_size is None else [batch_size]
-        best_qps = 0
-        best_latency = 0
-        best_batch_size = 0
         query_time_list = []
 
+        logger.info(f"Testing throughput with batch_size={batch_size}, workers={num_workers}...")
         
-        for nq in batch_sizes_to_test:
-            logger.info(f"Testing throughput with batch_size={nq}, workers={num_workers}...")
+        # Prepare query batches
+        query_batches = []
+        for i in range(0, queries.shape[0], batch_size):
+            end = min(i + batch_size, queries.shape[0])
+            query_batches.append(queries[i:end])
+        
+        def non_stop_search(cagra_index, search_params, query_batches, run_time, filter_obj, query_time_list):
+            # Copy CAGRA index to this process's GPU memory
+            queries_processed = 0
+            total_time = 0.0
             
-            # Prepare query batches
-            query_batches = []
-            for i in range(0, queries.shape[0], nq):
-                end = min(i + nq, queries.shape[0])
-                query_batches.append(queries[i:end])
+            start_time = time.time()
+            while True:
+                for query_batch in query_batches:
+                    # Convert to GPU
+                    query_batch_gpu = cp.asarray(query_batch)
+                    
+                    # Perform search
+                    t1 = time.time()
+                    if filter_obj is not None:
+                        distances, indices = cagra.search(search_params, cagra_index, query_batch_gpu, k=k, filter=filter_obj)
+                    else:
+                        distances, indices = cagra.search(search_params, cagra_index, query_batch_gpu, k=k)
+                    
+                    query_time = time.time() - t1
+                    query_time_list.append(query_time)
+                    
+                    # Update statistics
+                    queries_processed += 1  # Count as one batch
+                    total_time += query_time
+                    
+                    # Check if we've run for enough time
+                    if total_time >= run_time:
+                        return [queries_processed, total_time, query_time_list]
             
-            # Define non-stop search function (similar to the Milvus example)
-            def non_stop_search(cagra_index, search_params, query_batches, run_time, filter_obj, query_time_list):
-                # Copy CAGRA index to this process's GPU memory
-                queries_processed = 0
-                total_time = 0.0
-                
-                start_time = time.time()
-                while True:
-                    for query_batch in query_batches:
-                        # Convert to GPU
-                        query_batch_gpu = cp.asarray(query_batch)
-                        
-                        # Perform search
-                        t1 = time.time()
-                        if filter_obj is not None:
-                            distances, indices = cagra.search(search_params, cagra_index, query_batch_gpu, k=k, filter=filter_obj)
-                        else:
-                            distances, indices = cagra.search(search_params, cagra_index, query_batch_gpu, k=k)
-                        
-                        query_time = time.time() - t1
-                        query_time_list.append(query_time)
-                        
-                        # Update statistics
-                        queries_processed += 1  # Count as one batch
-                        total_time += query_time
-                        
-                        # Check if we've run for enough time
-                        if total_time >= run_time:
-                            return [queries_processed, total_time, query_time_list]
-            
-            # We can't easily use multiprocessing Pool with CAGRA since the index is in GPU
-            # Instead, we'll simulate parallel processing with threads
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            
-            run_time = 10  # 10 seconds per test
-            
-            t1 = time.time()
-            
-            # Create thread pool to simulate concurrent queries
-            futures = []
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                for i in range(num_workers):
-                    futures.append(executor.submit(
-                        non_stop_search, cagra_index, search_params, query_batches, run_time, filter_obj, query_time_list
-                    ))
+        # We can't easily use multiprocessing Pool with CAGRA since the index is in GPU
+        # Instead, we'll simulate parallel processing with threads
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        run_time = 10  # 10 seconds per test
+        
+        t1 = time.time()
+        
+        # Create thread pool to simulate concurrent queries
+        futures = []
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            for i in range(num_workers):
+                futures.append(executor.submit(
+                    non_stop_search, cagra_index, search_params, query_batches, run_time, filter_obj, query_time_list
+                ))
 
-            wait(futures)
+        wait(futures)
 
-            t2 = time.time()
+        t2 = time.time()
+        
+        # Wait for all to complete
+        sumq = 0
+        sumt = 0.0
+        query_time_p99s = []
+        result_query_time_list = []
             
-            # Wait for all to complete
-            sumq = 0
-            sumt = 0.0
-            query_time_p99s = []
-            result_query_time_list = []
+        for future in futures:
+            try:
+                result = future.result()
+                sumq += result[0]
+                sumt += result[1]
+                query_time_p99s.append(np.percentile(result[2], 99))
+            except Exception as e:
+                logger.error(f"Error in worker: {e}")
+        
+        
+        # Calculate metrics - using the same formula as in your code
+        #  qps = (sumq * nq) / sumt  # Multiply by batch size and num_workers
+        qps = (sumq * batch_size) / (t2-t1)
+        print("qps " + str(qps))
+        
+        latency = sum(query_time_p99s) / len(query_time_p99s) 
+        print("latency " + str(latency))
+        
+        logger.info(f"Batch size {batch_size}: time usage: {t2-t1:.2f}s, latency: {latency:.2f}ms, qps: {qps:.2f}")
+        
+        # Clean GPU memory
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
                 
-            for future in futures:
-                try:
-                    result = future.result()
-                    sumq += result[0]
-                    sumt += result[1]
-                    query_time_p99s.append(np.percentile(result[2], 99))
-                except Exception as e:
-                    logger.error(f"Error in worker: {e}")
-            
-            
-            # Calculate metrics - using the same formula as in your code
-            #  qps = (sumq * nq) / sumt  # Multiply by batch size and num_workers
-            qps = (sumq * nq) / (t2-t1)
-            print("sumt " + str(sumt))
-            print("(t2-t1) " +  str(t2-t1))
-            print("qps " + str(qps))
-            
-            # latency = sumt / (sumq * nq) * 1000 if sumq > 0 else 0  # ms per query
-            latency = sum(query_time_p99s) / len(query_time_p99s) 
-            print("latency " + str(latency))
-            
-            logger.info(f"Batch size {nq}: time usage: {t2-t1:.2f}s, latency: {latency:.2f}ms, qps: {qps:.2f}")
-            
-            # Track best performance
-            if qps > best_qps:
-                best_qps = qps
-                best_latency = latency
-                best_batch_size = nq
-            
-            # Clean GPU memory
-            gc.collect()
-            cp.get_default_memory_pool().free_all_blocks()
-        
-        logger.info(f"Best configuration: batch_size={best_batch_size}, QPS={best_qps:.2f}, latency={best_latency:.2f}ms")
-        
         # Return results as a dictionary
         return {
             **params,
@@ -349,7 +330,6 @@ def evaluate_parameter_combination_multithreading(params, vectors, queries, vect
             'build_time_seconds': build_time,
             
             # Parallel execution metrics - using Milvus benchmark methodology
-            'best_batch_size': best_batch_size,
             'p99_latency_ms': latency,
             'queries_per_second': qps,
             
@@ -400,7 +380,8 @@ def generate_hnsw_parameter_grid(param_ranges=None):
 # Add this function to evaluate HNSW parameters
 def evaluate_hnsw_combination_forloop(params, vectors, queries, vectors_fp, queries_fp,
                              vectors_strings=None, queries_strings=None, gt_indices=None,
-                             k=10, quantization_type="fp", batch_size=None, logger=None, filter_obj=None):
+                             k=10, quantization_type="fp", batch_size=None, logger=None, filter_obj=None,
+                             num_workers=1):
     """Evaluate HNSW parameter combination and return results."""
     import time
     import numpy as np
@@ -428,154 +409,96 @@ def evaluate_hnsw_combination_forloop(params, vectors, queries, vectors_fp, quer
         memory_increase_gb = post_build_memory['process_rss_gb'] - initial_memory['process_rss_gb']
         logger.info(f"Index build increased memory by {memory_increase_gb:.2f} GB")
 
-        # Initialize arrays to store results
-        all_indices = np.zeros((n_queries, n_candidates), dtype=np.int32)
-        all_distances = np.zeros((n_queries, n_candidates), dtype=np.float32)
-        
-        # Initialize variables for latency tracking
-        total_search_time = 0
-        search_times = []
-        
-        # Process queries in batches
-        for batch_start in range(0, n_queries, batch_size):
-            batch_end = min(batch_start + batch_size, n_queries)
-            batch_size_actual = batch_end - batch_start
-            
-            # Get batch of queries
-            batch_queries = queries[batch_start:batch_end]
-            
-            # Time the search
-            batch_start_time = time.time()
-            
-            # Perform FAISS search
-            batch_distances, batch_indices = hnsw_index.search(batch_queries, k=n_candidates,params=search_params)
-            
-            # Record search time
-            batch_search_time = time.time() - batch_start_time
-            total_search_time += batch_search_time
-            search_times.append(batch_search_time / batch_size_actual * 1000)  # ms per query
-            
-            # Store results in the overall arrays
-            all_indices[batch_start:batch_end, :] = batch_indices
-            all_distances[batch_start:batch_end, :] = batch_distances
-            # Debug raw search results for first query
-            logger.debug(f"Raw search for HNSW params: {params}")
-            logger.debug(f"{batch_indices[0]}")
-        
-        # Calculate average and p99 latency
-        avg_query_latency_ms = total_search_time / n_queries * 1000
-        p99_query_latency_ms = np.percentile(search_times, 99) if search_times else 0
-        
-        # Calculate queries per second
-        queries_per_second = n_queries / total_search_time
+        all_indices, total_search_time = batch_search_hnsw(queries, hnsw_index, search_params, filter_obj, k=k)
         
         # Calculate recall if we have ground truth
-        recall_score = None
-        if gt_indices is not None:
-            recall_score = calc_recall(all_indices, gt_indices)
+        recall_score = calc_recall(all_indices, gt_indices)
         
         logger.info(f"Recall HNSW {recall_score}")
 
         #Calculate QPS with multithreading - TRIAL
 
-        batch_sizes_to_test = [1, 10, 50] if batch_size is None else [batch_size]
-        best_qps = 0
-        best_latency = 0
-        best_batch_size = 0
-        num_workers = 4
         query_time_list = []
         
-        for nq in batch_sizes_to_test:
-            logger.info(f"Testing throughput with batch_size={nq}, workers={num_workers}...")
+        logger.info(f"Testing throughput with batch_size={batch_size}, workers={num_workers}...")
+        
+        # Prepare query batches
+        query_batches = []
+        for i in range(0, queries.shape[0], batch_size):
+            end = min(i + batch_size, queries.shape[0])
+            query_batches.append(queries[i:end])
+        
+        # Define non-stop search function (similar to the Milvus example)
+        def non_stop_search(hnsw_index, search_params, query_batches, run_time, query_time_list):
+            # Copy CAGRA index to this process's GPU memory
+            queries_processed = 0
+            total_time = 0.0
             
-            # Prepare query batches
-            query_batches = []
-            for i in range(0, queries.shape[0], nq):
-                end = min(i + nq, queries.shape[0])
-                query_batches.append(queries[i:end])
-            
-            # Define non-stop search function (similar to the Milvus example)
-            def non_stop_search(hnsw_index, search_params, query_batches, run_time, query_time_list):
-                # Copy CAGRA index to this process's GPU memory
-                queries_processed = 0
-                total_time = 0.0
-                
-                start_time = time.time()
-                while True:
-                    for query_batch in query_batches:
-                        # Convert to GPU
-                        
-                        # Perform search
-                        t1 = time.time()
-                        distances, indices =  hnsw_index.search(batch_queries, k=n_candidates,params=search_params)
-                        
-                        query_time = time.time() - t1
-                        query_time_list.append(query_time)
-                        
-                        # Update statistics
-                        queries_processed += 1  # Count as one batch
-                        total_time += query_time
-                        
-                        # Check if we've run for enough time
-                        if total_time >= run_time:
-                            return [queries_processed, total_time, query_time_list]
-            
-            # We can't easily use multiprocessing Pool with CAGRA since the index is in GPU
-            # Instead, we'll simulate parallel processing with threads
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            
-            run_time = 10  # 10 seconds per test
-            
-            t1 = time.time()
-            
-            # Create thread pool to simulate concurrent queries
-            futures = []
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                for i in range(num_workers):
-                    futures.append(executor.submit(
-                        non_stop_search, hnsw_index, search_params, query_batches, run_time, query_time_list
-                    ))
-            wait(futures)
+            start_time = time.time()
+            while True:
+                for query_batch in query_batches:
+                    # Convert to GPU
+                    
+                    # Perform search
+                    t1 = time.time()
+                    distances, indices =  hnsw_index.search(query_batch, k=n_candidates,params=search_params)
+                    
+                    query_time = time.time() - t1
+                    query_time_list.append(query_time)
+                    
+                    # Update statistics
+                    queries_processed += 1  # Count as one batch
+                    total_time += query_time
+                    
+                    # Check if we've run for enough time
+                    if total_time >= run_time:
+                        return [queries_processed, total_time, query_time_list]
+        
+        # We can't easily use multiprocessing Pool with CAGRA since the index is in GPU
+        # Instead, we'll simulate parallel processing with threads
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        run_time = 10  # 10 seconds per test
+        
+        t1 = time.time()
+        
+        # Create thread pool to simulate concurrent queries
+        futures = []
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            for i in range(num_workers):
+                futures.append(executor.submit(
+                    non_stop_search, hnsw_index, search_params, query_batches, run_time, query_time_list
+                ))
+        wait(futures)
 
-            t2 = time.time()
-                
-            # Wait for all to complete
-            sumq = 0
-            sumt = 0.0
-            query_time_p99s = []
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    sumq += result[0]
-                    sumt += result[1]
-                    query_time_p99s.append(np.percentile(result[2], 99))
-                except Exception as e:
-                    logger.error(f"Error in worker: {e}")
+        t2 = time.time()
+            
+        # Wait for all to complete
+        sumq = 0
+        sumt = 0.0
+        query_time_p99s = []
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                sumq += result[0]
+                sumt += result[1]
+                query_time_p99s.append(np.percentile(result[2], 99))
+            except Exception as e:
+                logger.error(f"Error in worker: {e}")
             
           
             
-            # Calculate metrics - using the same formula as in your code
-            # qps = sumq * num_workers / sumt
-            qps = (sumq * nq) / (t2-t1)
-            print("qps " + str(qps))
+        # Calculate metrics - using the same formula as in your code
+        # qps = sumq * num_workers / sumt
+        qps = (sumq * batch_size) / (t2-t1)
+        print("qps " + str(qps))
+        
+        # latency = sumt / (sumq * nq) * 1000 if sumq > 0 else 0  # ms per query
+        latency = sum(query_time_p99s) / len(query_time_p99s) 
+        print("latency " + str(latency))
             
-            # latency = sumt / (sumq * nq) * 1000 if sumq > 0 else 0  # ms per query
-            latency = sum(query_time_p99s) / len(query_time_p99s) 
-            print("latency " + str(latency))
-
+        logger.info(f"Batch size {batch_size}: time usage: {t2-t1:.2f}s, latency: {latency:.2f}ms, qps: {qps:.2f}")
             
-            
-            # qps = (sumq * nq * num_workers) / sumt  # Multiply by batch size and num_workers
-            # latency = sumt / (sumq * nq) * 1000 if sumq > 0 else 0  # ms per query
-            
-            logger.info(f"Batch size {nq}: time usage: {t2-t1:.2f}s, latency: {latency:.2f}ms, qps: {qps:.2f}")
-            
-            # Track best performance
-            if qps > best_qps:
-                best_qps = qps
-                best_latency = latency
-                best_batch_size = nq
-
 
         # Return results as a dictionary
         return {
@@ -775,7 +698,8 @@ def unified_grid_search(vectors=None, queries=None, vectors_fp=None, queries_fp=
                     queries_fp if quantization_type in ["fp16", "half_precision"] else queries,
                     vectors_fp, queries_fp,
                     vectors_strings, queries_strings, gt_indices,
-                    k, quantization_type, batch_size,logger=logger,filter_obj=bitquery_numpy
+                    k, quantization_type, batch_size,logger=logger,filter_obj=bitquery_numpy, 
+                    num_workers=num_workers
                 )
                 
             results.append(result)
