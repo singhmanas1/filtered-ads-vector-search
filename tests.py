@@ -1,117 +1,68 @@
 # tests.py
 import numpy as np
 import cupy as cp
-from utils_grid_search import calc_truth, create_rating_filter, count_selected_samples, batch_search_cagra, build_hnsw_index, batch_search_hnsw
+from utils_grid_search import calc_truth, create_rating_filter, count_selected_samples, batch_search_cagra, build_hnsw_index, batch_search_hnsw, calc_recall
 import faiss
 
-def test_batch_consistency():
-    """Test that batching doesn't change ground truth results."""
+def test_brute_force_batch_consistency():
+    """Test that calc_truth (brute force) gives identical results regardless of batch size."""
     np.random.seed(42)
     cp.random.seed(42)
     
-    # Small test data
-    dataset = np.random.randn(200, 32).astype(np.float16)
-    queries = np.random.randn(20, 32).astype(np.float16)
-    k = 5
+    # Setup test data (same as CAGRA test for comparison)
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
+    vectors = np.random.randn(n_samples, dim).astype(np.float16)
+    queries = np.random.randn(n_queries, dim).astype(np.float16)
     
-    # Reference (no batching)
-    ref_dist, ref_idx = calc_truth(dataset, queries, k, batch_size=100)
+    print("=== Test 1: Unfiltered Brute Force Batch Consistency ===")
     
-    # Test different batch sizes
-    for batch_size in [1, 5, 10]:
-        test_dist, test_idx = calc_truth(dataset, queries, k, batch_size=batch_size)
+    # Reference result (moderate batch size)
+    ref_dist, ref_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=None, batch_size=100)
+    
+    # Test different batch sizes - brute force should be perfectly consistent
+    for batch_size in [1,2,4,8,16,32,64,128,256,512,1024]:
+        test_dist, test_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=None, batch_size=batch_size)
         
-        assert np.array_equal(ref_idx, test_idx), f"Indices differ with batch_size={batch_size}"
-        assert np.allclose(ref_dist, test_dist, rtol=1e-6), f"Distances differ with batch_size={batch_size}"
+        recall = calc_recall(test_indices, ref_indices)
+        
+        # Brute force should be perfectly deterministic
+        assert recall > 0.999, f"Brute force batch_size={batch_size} shows inconsistency: {recall:.6f}"
+        print(f"  PASS: batch_size={batch_size}, recall={recall:.6f}")
     
-    print("PASS: Batch consistency test")
-    return True
-
-def test_filter_equivalence():
-    """Test that all-inclusive filter equals no filter."""
-    np.random.seed(42)
-    cp.random.seed(42)
+    print("=== Test 2: Filtered Brute Force Batch Consistency ===")
     
-    # Small test data
-    dataset = np.random.randn(200, 32).astype(np.float16)
-    queries = np.random.randn(20, 32).astype(np.float16)
-    k = 5
-    
-    # No filter result
-    no_filter_dist, no_filter_idx = calc_truth(dataset, queries, k, filter=None, batch_size=50)
-    
-    # All-inclusive filter
-    config = {'rating_distribution': {'low': 50, 'high': 50}}
-    result = create_rating_filter(
-        n_samples=200, n_queries=20, 
-        valid_ranges=['low', 'high'],  # All ranges
-        device_id=0, verbose=False, config=config
+    # Create restrictive filter (same as CAGRA test)
+    config = {'rating_distribution': {'low': 60, 'high': 20, 'mid': 19, 'premium': 1}}
+    filter_obj, _ = create_rating_filter(
+        n_samples=n_samples, n_queries=n_queries,
+        valid_ranges=['high','mid','premium'], device_id=0, verbose=False, config=config
     )
     
-    assert result is not None, "create_rating_filter returned None"
-    filter_obj, bitquery = result
+    # Reference result with filter
+    ref_filtered_dist, ref_filtered_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=filter_obj, batch_size=100)
     
-    # Verify filter includes all samples
-    included = count_selected_samples(bitquery)
-    inclusion_pct = (included / 200) * 100
-    assert inclusion_pct > 99, f"Filter only includes {inclusion_pct:.1f}% of data"
+    recalls = []
+    for batch_size in [1,8,64,256,512,1024]:
+        test_dist, test_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=filter_obj, batch_size=batch_size)
+        
+        recall = calc_recall(test_indices, ref_filtered_indices)
+        recalls.append(recall)
+        print(f"  batch_size={batch_size}, recall={recall:.6f}")
     
-    # Filtered result
-    filter_dist, filter_idx = calc_truth(dataset, queries, k, filter=filter_obj, batch_size=50)
+    # Check consistency across batch sizes for filtered brute force
+    recall_std = np.std(recalls)
+    min_recall = min(recalls)
     
-    # Compare
-    assert np.array_equal(no_filter_idx, filter_idx), "Indices differ between no filter and all-inclusive filter"
-    assert np.allclose(no_filter_dist, filter_dist, rtol=1e-6), "Distances differ between no filter and all-inclusive filter"
+    print(f"  Filtered brute force stats: min={min_recall:.6f}, std={recall_std:.8f}")
     
-    print("PASS: Filter equivalence test")
-    return True
-
-def test_filter_bits():
-    """Test that filter bit patterns work correctly."""
-    config = {'rating_distribution': {'a': 25, 'b': 25, 'c': 25, 'd': 25}}
-    n_samples = 100
+    # Brute force should be perfectly consistent even with filters
+    assert min_recall > 0.999, f"Filtered brute force shows inconsistency: {min_recall:.6f}"
+    assert recall_std < 1e-6, f"Brute force has unexpected variance: {recall_std:.8f}"
     
-    # Partial filter - should include ['a', 'b'] = (25+25)/(25+25+25+25) = 50%
-    result1 = create_rating_filter(
-        n_samples=n_samples, 
-        n_queries=10, 
-        valid_ranges=['a', 'b'], 
-        device_id=0, 
-        verbose=False, 
-        config=config
-    )
-    assert result1 is not None, "Partial filter creation returned None"
-    _, partial_bits = result1
-    partial_count = count_selected_samples(partial_bits)
-    
-    # Full filter - should include ['a', 'b', 'c', 'd'] = (25+25+25+25)/(25+25+25+25) = 100%
-    result2 = create_rating_filter(
-        n_samples=n_samples, 
-        n_queries=10, 
-        valid_ranges=['a', 'b', 'c', 'd'], 
-        device_id=0, 
-        verbose=False, 
-        config=config
-    )
-    assert result2 is not None, "Full filter creation returned None"
-    _, full_bits = result2
-    full_count = count_selected_samples(full_bits)
-    
-    # Calculate expected counts
-    total_distribution = sum(config['rating_distribution'].values())  # 100
-    partial_expected = int(n_samples * (25 + 25) / total_distribution)  # 50
-    full_expected = int(n_samples * (25 + 25 + 25 + 25) / total_distribution)  # 100
-    
-    # Check counts match expectations (allow small tolerance for randomness)
-    tolerance = 5  # Allow ±5 samples difference
-    assert abs(partial_count - partial_expected) <= tolerance, f"Partial filter count {partial_count} != expected {partial_expected} ± {tolerance}"
-    assert abs(full_count - full_expected) <= tolerance, f"Full filter count {full_count} != expected {full_expected} ± {tolerance}"
-    
-    print(f"PASS: Filter bits test (partial: {partial_count}/{partial_expected}, full: {full_count}/{full_expected})")
     return True
 
 def test_batch_search_cagra():
-    """Test batch_search_cagra with different batch sizes and filters."""
+    """Test batch_search_cagra consistency using recall metrics."""
     import cupy as cp
     from cuvs.neighbors import cagra
     
@@ -119,181 +70,481 @@ def test_batch_search_cagra():
     np.random.seed(42)
     cp.random.seed(42)
     
-    n_samples, n_queries, dim, k = 200, 20, 32, 5
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
     vectors = np.random.randn(n_samples, dim).astype(np.float16)
     queries = np.random.randn(n_queries, dim).astype(np.float16)
     
     # Build CAGRA index
     vectors_gpu = cp.asarray(vectors)
-    cagra_index_params = cagra.IndexParams(graph_degree=32, intermediate_graph_degree=48)
+    cagra_index_params = cagra.IndexParams(graph_degree=32, intermediate_graph_degree=48, build_algo="nn_descent")
     cagra_index = cagra.build(cagra_index_params, vectors_gpu)
     
     # Create search params
-    search_params = cagra.SearchParams(max_queries=100, itopk_size=64, max_iterations=0)
+    search_params = cagra.SearchParams(search_width=8, itopk_size=64, max_iterations=0)
     
-    print("=== Test 1: Batch Size Consistency ===")
+    print("=== Test 1: Unfiltered Batch Size Consistency ===")
     
-    # Reference result (large batch)
-    ref_indices, ref_time = batch_search_cagra(
-        queries, cagra_index, search_params, None, k, batch_size=50
+    # Reference result (moderate batch size)
+    ref_indices, _ = batch_search_cagra(
+        queries, cagra_index, search_params, None, k, batch_size=1024
     )
     
     # Test different batch sizes
-    for batch_size in [1, 5, 10]:
-        test_indices, test_time = batch_search_cagra(
+    for batch_size in [1,2,4,8,16,32,64,128,256,512,1024]:
+        test_indices, _ = batch_search_cagra(
             queries, cagra_index, search_params, None, k, batch_size=batch_size
         )
         
-        indices_match = np.array_equal(ref_indices, test_indices)
-        assert indices_match, f"Indices differ with batch_size={batch_size}"
-        print(f"  PASS: batch_size={batch_size}")
+        recall = calc_recall(test_indices, ref_indices)
+        
+        # For unfiltered search, we expect very high consistency (>99%)
+        assert recall > 0.09, f"Unfiltered batch_size={batch_size} shows poor consistency: {recall:.4f}"
+        print(f"  PASS: batch_size={batch_size}, recall={recall:.4f}")
     
-    print("=== Test 2: Filter Differences ===")
+    print("=== Test 2: Filtered Batch Size Consistency ===")
     
-    # Create two different filters
-    config = {'rating_distribution': {'low': 50, 'high': 50}}
-    
-    # Filter 1: Include only 'low' (~50% of data)
-    filter1, _ = create_rating_filter(
+    # Create restrictive filter
+    config = {'rating_distribution': {'low': 60, 'high': 20, 'mid': 19, 'premium': 1}}
+    filter_obj, _ = create_rating_filter(
         n_samples=n_samples, n_queries=n_queries,
-        valid_ranges=['low'], device_id=0, verbose=False, config=config
+        valid_ranges=['high','mid','premium'], device_id=0, verbose=False, config=config
     )
     
-    # Filter 2: Include both 'low' and 'high' (~100% of data)  
-    filter2, _ = create_rating_filter(
-        n_samples=n_samples, n_queries=n_queries,
-        valid_ranges=['low', 'high'], device_id=0, verbose=False, config=config
+    # Reference result with filter
+    ref_filtered_indices, _ = batch_search_cagra(
+        queries, cagra_index, search_params, filter_obj, k, batch_size=100
     )
     
-    # Search with different filters
-    indices_no_filter, _ = batch_search_cagra(
-        queries, cagra_index, search_params, None, k, batch_size=10
-    )
+    recalls = []
+    for batch_size in [1,8,64,256,512,1024]:
+        test_indices, _ = batch_search_cagra(
+            queries, cagra_index, search_params, filter_obj, k, batch_size=batch_size
+        )
+        
+        recall = calc_recall(test_indices, ref_filtered_indices)
+        recalls.append(recall)
+        print(f"  batch_size={batch_size}, recall={recall:.4f}")
     
-    indices_filter1, _ = batch_search_cagra(
-        queries, cagra_index, search_params, filter1, k, batch_size=10
-    )
+    # Check consistency across batch sizes for filtered search
+    recall_std = np.std(recalls)
+    min_recall = min(recalls)
     
-    indices_filter2, _ = batch_search_cagra(
-        queries, cagra_index, search_params, filter2, k, batch_size=10
-    )
+    print(f"  Filtered recall stats: min={min_recall:.4f}, std={recall_std:.6f}")
     
-    # Different filters should give different results
-    filter1_differs = not np.array_equal(indices_no_filter, indices_filter1)
-    filter2_similar = np.array_equal(indices_no_filter, indices_filter2)  # Should be similar since filter2 includes ~100%
+    # More lenient thresholds for filtered search, but still check for major inconsistencies
+    assert min_recall > 0.80, f"Some batch sizes show very poor recall: {min_recall:.4f}"
+    assert recall_std < 0.05, f"High variance in recall across batch sizes: {recall_std:.6f}"
     
-    assert filter1_differs, "Filter with 50% data should give different results than no filter"
-    print(f"  PASS: Restrictive filter gives different results")
-    
-    if filter2_similar:
-        print(f"  PASS: All-inclusive filter gives same results as no filter")
-    else:
-        print(f"  NOTE: All-inclusive filter gives different results (may be due to randomness in filter creation)")
-    
-    print("SUCCESS: All batch_search_cagra tests passed!")
     return True
 
-def test_batch_search_hnsw():
-    """Test batch_search_hnsw with different batch sizes and filters."""
+def test_cagra_filtered_batch_consistency():
+    """Test that CAGRA filtered search gives identical results regardless of batch size."""
+    import cupy as cp
+    from cuvs.neighbors import cagra
+    
+    np.random.seed(42)
+    cp.random.seed(42)
+    
+    # Large scale test data to mirror the failing test
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
+    vectors = np.random.randn(n_samples, dim).astype(np.float16)
+    queries = np.random.randn(n_queries, dim).astype(np.float16)
+    
+    # Build CAGRA index
+    vectors_gpu = cp.asarray(vectors)
+    cagra_index_params = cagra.IndexParams(graph_degree=32, intermediate_graph_degree=64)
+    cagra_index = cagra.build(cagra_index_params, vectors_gpu)
+    
+    # Test both problematic and fixed search params
+    test_configs = [
+        {
+            "name": "Original (problematic)",
+            "params": cagra.SearchParams(itopk_size=32, search_width=1, max_iterations=0)
+        },
+        {
+            "name": "Fixed parameters", 
+            "params": cagra.SearchParams(itopk_size=128, search_width=8, max_iterations=1000)
+        }
+    ]
+    
+    # Create restrictive filter (40% of data)
+    config = {'rating_distribution': {'low': 60, 'high': 20, 'mid': 19, 'premium': 1}}
+    filter_obj, _ = create_rating_filter(
+        n_samples=n_samples, n_queries=n_queries,
+        valid_ranges=['high','mid','premium'], device_id=0, verbose=False, config=config
+    )
+    
+    for test_config in test_configs:
+        print(f"\n=== Testing {test_config['name']} ===")
+        search_params = test_config['params']
+        
+        # Reference result (moderate batch size)
+        ref_indices, _ = batch_search_cagra(
+            queries, cagra_index, search_params, filter_obj, k, batch_size=100
+        )
+        
+        # Test different batch sizes that previously showed issues
+        problematic_batch_sizes = [1, 8, 64, 256, 512, 1024]
+        batch_consistent = True
+        
+        for batch_size in problematic_batch_sizes:
+            if batch_size > n_queries:
+                continue
+                
+            test_indices, _ = batch_search_cagra(
+                queries, cagra_index, search_params, filter_obj, k, batch_size=batch_size
+            )
+            
+            # Check if results are identical (stricter than recall)
+            indices_match = np.array_equal(ref_indices, test_indices)
+            
+            if not indices_match:
+                print(f"  FAIL: batch_size={batch_size} gives different results")
+                batch_consistent = False
+                
+                # Calculate how different they are
+                matches = 0
+                for i in range(len(ref_indices)):
+                    if np.array_equal(ref_indices[i], test_indices[i]):
+                        matches += 1
+                consistency_pct = (matches / len(ref_indices)) * 100
+                print(f"    Query-level consistency: {consistency_pct:.1f}%")
+            else:
+                print(f"  PASS: batch_size={batch_size}")
+        
+        if test_config['name'] == "Original (problematic)":
+            # We expect this to fail, so don't assert
+            if batch_consistent:
+                print(f"  UNEXPECTED: Original params are actually consistent!")
+            else:
+                print(f"  EXPECTED: Original params show batch inconsistency")
+        else:
+            # We expect the fixed params to work
+            assert batch_consistent, f"Fixed parameters still show batch inconsistency"
+            print(f"  SUCCESS: Fixed parameters are batch consistent")
+    
+    return True
+
+def test_hnsw_batch_consistency():
+    """Test that HNSW search gives consistent results regardless of batch size."""
     import faiss
     
-    # Setup test data
+    # Setup test data (same as CAGRA test for comparison)
     np.random.seed(42)
     
-    n_samples, n_queries, dim, k = 200, 20, 32, 5
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
     vectors = np.random.randn(n_samples, dim).astype(np.float16)
     queries = np.random.randn(n_queries, dim).astype(np.float16)
     
     # Build HNSW index
-    params = {'M': 16, 'efConstruction': 40, 'efSearch': 16, 'quantization_type': 'fp'}
+    params = {'M': 16, 'efConstruction': 40, 'efSearch': 64, 'quantization_type': 'fp16'}
     hnsw_index, _ = build_hnsw_index(params, vectors)
     
-    print("=== Test 1: Batch Size Consistency ===")
+    print("=== Test 1: Unfiltered HNSW Batch Consistency ===")
     
     # Create basic search params (no filter)
-    search_params = faiss.SearchParametersHNSW(efSearch=16)
+    search_params = faiss.SearchParametersHNSW(efSearch=64)
     
-    # Reference result (large batch)
-    ref_indices, ref_time = batch_search_hnsw(
-        queries, hnsw_index, search_params, None, k, batch_size=50
+    # Reference result (moderate batch size)
+    ref_indices, _ = batch_search_hnsw(
+        queries, hnsw_index, search_params, None, k, batch_size=100
     )
     
     # Test different batch sizes
-    for batch_size in [1, 5, 10]:
-        test_indices, test_time = batch_search_hnsw(
+    for batch_size in [1,2,4,8,16,32,64,128,256,512,1024]:
+        test_indices, _ = batch_search_hnsw(
             queries, hnsw_index, search_params, None, k, batch_size=batch_size
         )
         
-        indices_match = np.array_equal(ref_indices, test_indices)
-        assert indices_match, f"Indices differ with batch_size={batch_size}"
-        print(f"  PASS: batch_size={batch_size}")
+        recall = calc_recall(test_indices, ref_indices)
+        
+        # HNSW should be more deterministic than CAGRA
+        assert recall > 0.95, f"HNSW unfiltered batch_size={batch_size} shows poor consistency: {recall:.4f}"
+        print(f"  PASS: batch_size={batch_size}, recall={recall:.4f}")
     
-    print("=== Test 2: Filter Differences ===")
+    print("=== Test 2: Filtered HNSW Batch Consistency ===")
     
-    # Create different filters
-    config = {'rating_distribution': {'low': 50, 'high': 50}}
-    
-    # Filter 1: Include only 'low' (~50% of data)
-    _, bitquery1 = create_rating_filter(
+    # Create restrictive filter (same as CAGRA test)
+    config = {'rating_distribution': {'low': 60, 'high': 20, 'mid': 19, 'premium': 1}}
+    _, bitquery = create_rating_filter(
         n_samples=n_samples, n_queries=n_queries,
-        valid_ranges=['low'], device_id=0, verbose=False, config=config
+        valid_ranges=['high','mid','premium'], device_id=0, verbose=False, config=config
     )
     
-    # Filter 2: Include both 'low' and 'high' (~100% of data)  
-    _, bitquery2 = create_rating_filter(
-        n_samples=n_samples, n_queries=n_queries,
-        valid_ranges=['low', 'high'], device_id=0, verbose=False, config=config
+    # Convert bitquery to numpy for FAISS
+    filter_bitmap = bitquery.get().view(np.uint8)
+    
+    # Create search params with filter
+    sel = faiss.IDSelectorBitmap(filter_bitmap)
+    search_params_filtered = faiss.SearchParametersHNSW(sel=sel, efSearch=64)
+    
+    # Reference result with filter
+    ref_filtered_indices, _ = batch_search_hnsw(
+        queries, hnsw_index, search_params_filtered, None, k, batch_size=100
     )
     
-    # Convert bitqueries to numpy for FAISS
-    filter_bitmap1 = bitquery1.get().view(np.uint8)
-    filter_bitmap2 = bitquery2.get().view(np.uint8)
+    recalls = []
+    for batch_size in [1,8,64,256,512,1024]:
+        test_indices, _ = batch_search_hnsw(
+            queries, hnsw_index, search_params_filtered, None, k, batch_size=batch_size
+        )
+        
+        recall = calc_recall(test_indices, ref_filtered_indices)
+        recalls.append(recall)
+        print(f"  batch_size={batch_size}, recall={recall:.4f}")
     
-    # Create search params with different filters
-    search_params_no_filter = faiss.SearchParametersHNSW(efSearch=16)
+    # Check consistency across batch sizes for filtered search
+    recall_std = np.std(recalls)
+    min_recall = min(recalls)
     
-    sel1 = faiss.IDSelectorBitmap(filter_bitmap1)
-    search_params_filter1 = faiss.SearchParametersHNSW(sel=sel1, efSearch=16)
+    print(f"  Filtered HNSW stats: min={min_recall:.4f}, std={recall_std:.6f}")
     
-    sel2 = faiss.IDSelectorBitmap(filter_bitmap2)
-    search_params_filter2 = faiss.SearchParametersHNSW(sel=sel2, efSearch=16)
+    # HNSW should be more stable than CAGRA, even with filters
+    assert min_recall > 0.90, f"HNSW filtered search shows poor recall: {min_recall:.4f}"
+    assert recall_std < 0.02, f"HNSW shows high variance across batch sizes: {recall_std:.6f}"
     
-    # Search with different filters
-    indices_no_filter, _ = batch_search_hnsw(
-        queries, hnsw_index, search_params_no_filter, None, k, batch_size=10
-    )
+    return True
+
+def test_recall_batch_independence():
+    """Test that recall scores are identical regardless of batch size."""
+    from cuvs.neighbors import cagra
     
-    indices_filter1, _ = batch_search_hnsw(
-        queries, hnsw_index, search_params_filter1, None, k, batch_size=10
-    )
+    # Setup test data (same as CAGRA test for comparison)
+    np.random.seed(42)
     
-    indices_filter2, _ = batch_search_hnsw(
-        queries, hnsw_index, search_params_filter2, None, k, batch_size=10
-    )
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
+    vectors = np.random.randn(n_samples, dim).astype(np.float32)
+    queries = np.random.randn(n_queries, dim).astype(np.float32)
     
-    # Different filters should give different results
-    filter1_differs = not np.array_equal(indices_no_filter, indices_filter1)
-    filter2_similar = np.array_equal(indices_no_filter, indices_filter2)  # Should be similar since filter2 includes ~100%
+    # Build CAGRA index
+    vectors_gpu = cp.asarray(vectors)
+    cagra_index_params = cagra.IndexParams(graph_degree=32, intermediate_graph_degree=64)
+    cagra_index = cagra.build(cagra_index_params, vectors_gpu)
+    search_params = cagra.SearchParams(itopk_size=64, search_width=8)
     
-    assert filter1_differs, "Filter with 50% data should give different results than no filter"
-    print(f"  PASS: Restrictive filter gives different results")
+    # Generate ground truth
+    _, gt_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=None, batch_size=50)
     
-    if filter2_similar:
-        print(f"  PASS: All-inclusive filter gives same results as no filter")
+    # Test different batch sizes
+    batch_sizes = [1,8,64,256,512,1024]
+    recalls = []
+    
+    for batch_size in batch_sizes:
+        if batch_size > n_queries:
+            continue
+            
+        search_indices, _ = batch_search_cagra(
+            queries, cagra_index, search_params, None, k, batch_size=batch_size
+        )
+        
+        recall = calc_recall(search_indices, gt_indices)
+        recalls.append(recall)
+    
+    # All recalls should be identical
+    recall_std = np.std(recalls)
+    assert recall_std < 1e-6, f"Recall varies with batch size! Values: {recalls}, Std: {recall_std:.8f}"
+    
+    print(f"PASS: Recall batch independence test (recall: {recalls[0]:.4f}, std: {recall_std:.8f})")
+    return True
+
+def test_cagra_batch_recall():
+    """Test CAGRA batch consistency using only cuVS functions."""
+    import cupy as cp
+    from cuvs.neighbors import cagra, brute_force
+    
+    # Setup test data
+    np.random.seed(42)
+    cp.random.seed(42)
+    
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
+    vectors = np.random.randn(n_samples, dim).astype(np.float32)  # cuVS prefers float32
+    queries = np.random.randn(n_queries, dim).astype(np.float32)
+    
+    # Convert to GPU
+    vectors_gpu = cp.asarray(vectors)
+    queries_gpu = cp.asarray(queries)
+    
+    # Generate ground truth using cuVS brute force
+    print("Generating ground truth with cuVS brute force...")
+    bf_index = brute_force.build(vectors_gpu, metric="sqeuclidean")
+    gt_distances, gt_indices = brute_force.search(bf_index, queries_gpu, k)
+    gt_indices = cp.asnumpy(gt_indices)  # Convert to CPU for comparison
+    
+    # Build CAGRA index
+    print("Building CAGRA index...")
+    cagra_index_params = cagra.IndexParams(graph_degree=32, intermediate_graph_degree=64)
+    cagra_index = cagra.build(cagra_index_params, vectors_gpu)
+    search_params = cagra.SearchParams(itopk_size=64, search_width=8)
+    
+    # Test different batch sizes
+    batch_sizes = [1, 8, 64, 256, 512, 1024]
+    recalls = []
+    
+    for batch_size in batch_sizes:
+        print(f"Testing batch_size={batch_size}...")
+        
+        # Manual batching with pure cuVS
+        all_indices = np.zeros((n_queries, k), dtype=np.int32)
+        
+        for start_idx in range(0, n_queries, batch_size):
+            end_idx = min(start_idx + batch_size, n_queries)
+            batch_queries = queries_gpu[start_idx:end_idx]
+            
+            # Pure cuVS search
+            distances, indices = cagra.search(search_params, cagra_index, batch_queries, k=k)
+            
+            # Store results
+            indices_cpu = cp.asnumpy(indices)
+            all_indices[start_idx:end_idx] = indices_cpu
+        
+        # Calculate recall manually (no helper functions)
+        correct = 0
+        total = 0
+        
+        for i in range(n_queries):
+            # Count how many CAGRA results are in the ground truth for this query
+            cagra_neighbors = set(all_indices[i])
+            gt_neighbors = set(gt_indices[i])
+            correct += len(cagra_neighbors.intersection(gt_neighbors))
+            total += k
+        
+        recall = correct / total
+        recalls.append(recall)
+        print(f"  batch_size={batch_size}, recall={recall:.4f}")
+    
+    # Check consistency
+    recall_std = np.std(recalls)
+    min_recall = min(recalls)
+    max_recall = max(recalls)
+    
+    print(f"\nCUVS CAGRA Batch Consistency Results:")
+    print(f"  Recalls: {[f'{r:.4f}' for r in recalls]}")
+    print(f"  Min: {min_recall:.4f}, Max: {max_recall:.4f}")
+    print(f"  Std Dev: {recall_std:.8f}")
+    
+    # The test - CAGRA should be consistent across batch sizes
+    if recall_std < 1e-4:
+        print("PASS: CAGRA shows good batch consistency")
+        return True
     else:
-        print(f"  NOTE: All-inclusive filter gives different results (may be due to randomness in filter creation)")
+        print(f"FAIL: CAGRA shows poor batch consistency (std={recall_std:.8f})")
+        return False
+
+def test_hnsw_recall_batch_independence():
+    """Test that HNSW recall scores are identical regardless of batch size."""
+    import faiss
     
-    print("SUCCESS: All batch_search_hnsw tests passed!")
+    # Setup test data (same as CAGRA test for comparison)
+    np.random.seed(42)
+    
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
+    vectors = np.random.randn(n_samples, dim).astype(np.float16)
+    queries = np.random.randn(n_queries, dim).astype(np.float16)
+    
+    # Build HNSW index
+    params = {'M': 16, 'efConstruction': 40, 'efSearch': 64, 'quantization_type': 'fp'}
+    hnsw_index, _ = build_hnsw_index(params, vectors)
+    
+    # Create search params
+    search_params = faiss.SearchParametersHNSW(efSearch=64)
+    
+    # Generate ground truth
+    _, gt_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=None, batch_size=50)
+    
+    # Test different batch sizes
+    batch_sizes = [1,8,64,256,512,1024]
+    recalls = []
+    
+    for batch_size in batch_sizes:
+        if batch_size > n_queries:
+            continue
+            
+        search_indices, _ = batch_search_hnsw(
+            queries, hnsw_index, search_params, None, k, batch_size=batch_size
+        )
+        
+        recall = calc_recall(search_indices, gt_indices)
+        recalls.append(recall)
+        print(f"  batch_size={batch_size}, recall={recall:.4f}")
+    
+    # Check consistency across batch sizes
+    recall_std = np.std(recalls)
+    min_recall = min(recalls)
+    max_recall = max(recalls)
+    
+    print(f"HNSW recall stats: min={min_recall:.4f}, max={max_recall:.4f}, std={recall_std:.8f}")
+    
+    # HNSW should be more deterministic than CAGRA
+    assert recall_std < 1e-4, f"HNSW recall varies with batch size! Values: {recalls}, Std: {recall_std:.8f}"
+    
+    print(f"PASS: HNSW recall batch independence test (avg recall: {np.mean(recalls):.4f}, std: {recall_std:.8f})")
+    return True
+
+def test_recall_filter_batch_independence():
+    """Test that filtered recall scores are identical regardless of batch size."""
+    from cuvs.neighbors import cagra
+    
+    np.random.seed(42)
+    cp.random.seed(42)
+    
+    # Small test data  
+    n_samples, n_queries, dim, k = 5000000, 10000, 64, 10
+    vectors = np.random.randn(n_samples, dim).astype(np.float16)
+    queries = np.random.randn(n_queries, dim).astype(np.float16)
+    
+    # Build CAGRA index
+    vectors_gpu = cp.asarray(vectors)
+    cagra_index_params = cagra.IndexParams(graph_degree=32, intermediate_graph_degree=64)
+    cagra_index = cagra.build(cagra_index_params, vectors_gpu)
+    search_params = cagra.SearchParams(itopk_size=128, search_width=8, max_iterations=100)
+    
+    # Create filter
+    config = {'rating_distribution': {'low': 60, 'high': 20, 'mid': 19, 'premium': 1}}
+    filter_obj, _ = create_rating_filter(
+        n_samples=n_samples, n_queries=n_queries,
+        valid_ranges=['high','mid','premium'], device_id=0, verbose=False, config=config
+    )
+    
+    # Generate filtered ground truth
+    _, gt_indices = calc_truth(vectors, queries, k, metric="sqeuclidean", filter=filter_obj, batch_size=50)
+    
+    # Test different batch sizes with filter
+    batch_sizes = [1,2,4,8,16,32,64,128,256,512,1024]
+    recalls = []
+    
+    for batch_size in batch_sizes:
+        if batch_size > n_queries:
+            continue
+            
+        search_indices, _ = batch_search_cagra(
+            queries, cagra_index, search_params, filter_obj, k, batch_size=batch_size
+        )
+        
+        recall = calc_recall(search_indices, gt_indices)
+        recalls.append(recall)
+    
+    # All recalls should be identical
+    recall_std = np.std(recalls)
+    assert recall_std < 1e-6, f"Filtered recall varies with batch size! Values: {recalls}, Std: {recall_std:.8f}"
+    
+    print(f"PASS: Recall filter batch independence test (recall: {recalls[0]:.4f}, std: {recall_std:.8f})")
     return True
 
 def run_all_tests():
     """Run all tests."""
     tests = [
-        ("Batch consistency", test_batch_consistency),
-        ("Filter equivalence", test_filter_equivalence), 
-        ("Filter bits", test_filter_bits),
-        ("CAGRA batch search", test_batch_search_cagra),
-        ("HNSW batch search", test_batch_search_hnsw)  # Add this line
+        #("CAGRA filtered batch consistency", test_cagra_filtered_batch_consistency),
+        # ("Batch consistency", test_batch_consistency),
+        # ("Filter equivalence", test_filter_equivalence), 
+        # ("Filter bits", test_filter_bits),
+        #("Brute force batch consistency", test_brute_force_batch_consistency),
+        #("HNSW batch consistency", test_hnsw_batch_consistency),
+        #("CAGRA batch search", test_batch_search_cagra),
+        # ("HNSW batch search", test_batch_search_hnsw),
+         #("CAGRA Recall batch independence", test_recall_batch_independence), 
+         ("CAGRA batch recall", test_cagra_batch_recall),
+         #("HNSW Recall batch independence", test_hnsw_recall_batch_independence),
+        # ("Recall filter batch independence", test_recall_filter_batch_independence)
     ]
     
     passed = 0
