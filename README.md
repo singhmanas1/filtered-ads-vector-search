@@ -55,7 +55,7 @@ amazon_review_embeddings/
 
 ### Basic Usage
 ```bash
-python cuvs_bench_grid_search_v2.py \
+python cuvs_bench_grid_search_v3.py \
     --quantization-folder half_precision \
     --quantization-folder-path ./amazon_review_embeddings
 ```
