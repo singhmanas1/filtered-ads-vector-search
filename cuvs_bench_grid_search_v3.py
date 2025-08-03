@@ -268,7 +268,7 @@ def evaluate_parameter_combination_multithreading(params, vectors, queries, vect
         # Instead, we'll simulate parallel processing with threads
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        run_time = 0.1  # 1 seconds per test
+        run_time = 1  # 1 seconds per test
         
         t1 = time.time()
         
@@ -438,7 +438,7 @@ def evaluate_hnsw_combination_forloop(params, vectors, queries, vectors_fp, quer
         # Instead, we'll simulate parallel processing with threads
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        run_time = 0.1  # 1 seconds per test
+        run_time = 3  # 10 seconds per test
         
         t1 = time.time()
         

@@ -1,7 +1,11 @@
 #!/bin/bash
-export NGC_API_KEY=nvapi-xxx
+export NGC_API_KEY=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
 export LOCAL_NIM_CACHE=~/.cache/nim
 mkdir -p "$LOCAL_NIM_CACHE"
+
+# Log into NVIDIA Container Registry
+echo $NGC_API_KEY | docker login nvcr.io --username '$oauthtoken' --password-stdin
+
 docker run -it --rm \
     --gpus all \
     --shm-size=16GB \
